@@ -20,6 +20,7 @@ from app.core.database import Base
 from app.models.patient import utc_now
 
 if TYPE_CHECKING:
+    from app.models.assessment_attachment import AssessmentAttachment
     from app.models.diagnostic_report import DiagnosticReport
     from app.models.patient import Patient
 
@@ -116,5 +117,10 @@ class ClinicalAssessment(Base):
     diagnostic_reports: Mapped[list["DiagnosticReport"]] = relationship(
         back_populates="assessment",
         order_by="DiagnosticReport.created_at.desc()",
+    )
+    attachments: Mapped[list["AssessmentAttachment"]] = relationship(
+        back_populates="assessment",
+        order_by="AssessmentAttachment.created_at.asc()",
+        cascade="all, delete-orphan",
     )
 

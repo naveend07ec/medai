@@ -1,29 +1,29 @@
-import { useState } from 'react'
-import { createAssessment, createPatient } from '../api/clinical'
-import { submitDiabetesPrediction } from '../api/predictions'
+import { useEffect, useState } from 'react'
+import {
+  createAssessment,
+  createPatient,
+  fetchAssessment,
+  fetchAssessmentAttachmentImageFile,
+  uploadAssessmentDocuments,
+  uploadAssessmentImages,
+} from '../api/clinical'
 import type {
+  AssessmentAttachmentRecord,
   AssessmentDraft,
   ClinicalAssessmentRecord,
   PatientRecord,
-  PredictiveExperimentOutcome,
 } from '../types/assessment'
-import type { PredictiveModelHealth } from '../types/prediction'
 import {
-  buildPreprocessingSummary,
   computeAgeYears,
   createEmptyDraft,
   evaluateClinicalMeasurements,
-  PIMA_FEATURE_FIELDS,
-  type PimaFeatureKey,
   validateAssessmentDraft,
 } from '../utils/assessmentValidation'
 
 interface PatientAssessmentWorkflowProps {
   patients: PatientRecord[]
-  health: PredictiveModelHealth | null
-  healthError: string | null
   prefillPatient: PatientRecord | null
-  onRefreshHealth: () => void
+  prefillAssessment?: ClinicalAssessmentRecord | null
   onAssessmentSaved: (
     assessment: ClinicalAssessmentRecord,
     createdPatient: PatientRecord | null,
@@ -33,16 +33,95 @@ interface PatientAssessmentWorkflowProps {
 
 type WorkflowStage = 'intake' | 'processing'
 
+function parseMedicalHistoryNotes(rawNotes: string | null): {
+  knownAllergies: string
+  medicalHistoryNotes: string
+} {
+  if (!rawNotes) {
+    return { knownAllergies: '', medicalHistoryNotes: '' }
+  }
+  const lines = rawNotes.split(/\r?\n/)
+  const remaining: string[] = []
+  let knownAllergies = ''
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (!knownAllergies && /^Known Allergies:/i.test(trimmed)) {
+      knownAllergies = trimmed.replace(/^Known Allergies:\s*/i, '').trim()
+    } else {
+      remaining.push(line)
+    }
+  }
+
+  return {
+    knownAllergies,
+    medicalHistoryNotes: remaining.join('\n').trim(),
+  }
+}
+
+function createDraftFromAssessment(
+  assessment: ClinicalAssessmentRecord,
+): AssessmentDraft {
+  const base = createEmptyDraft()
+  const parsedHistory = parseMedicalHistoryNotes(assessment.medical_history_notes)
+
+  return {
+    ...base,
+    patientInfo: {
+      ...base.patientInfo,
+      patientMode: 'existing',
+      existingPatientId: assessment.patient_id,
+      demographicsNotes: assessment.demographics_notes ?? '',
+    },
+    symptomsHistory: {
+      currentSymptoms: assessment.current_symptoms ?? '',
+      symptomDuration: assessment.symptom_duration ?? '',
+      previousConditions: assessment.previous_conditions ?? '',
+      existingMedications: assessment.existing_medications ?? '',
+      knownAllergies: parsedHistory.knownAllergies,
+      medicalHistoryNotes: parsedHistory.medicalHistoryNotes,
+    },
+    clinicalMeasurements: {
+      systolicBp:
+        assessment.systolic_bp != null ? String(assessment.systolic_bp) : '',
+      diastolicBp:
+        assessment.diastolic_bp != null ? String(assessment.diastolic_bp) : '',
+      heartRate:
+        assessment.heart_rate != null ? String(assessment.heart_rate) : '',
+      bodyTemperature:
+        assessment.body_temperature != null
+          ? String(assessment.body_temperature)
+          : '',
+      oxygenSaturation:
+        assessment.oxygen_saturation != null
+          ? String(assessment.oxygen_saturation)
+          : '',
+      additionalMeasurements: assessment.additional_measurements ?? '',
+    },
+    medicalRecords: {
+      labResults: assessment.lab_results ?? '',
+      ehrSummary: assessment.ehr_summary ?? '',
+      previousReports: assessment.previous_reports ?? '',
+      attachedReportNames: [],
+    },
+    medicalImages: {
+      attachedImages: [],
+      imagingNotes: assessment.imaging_notes ?? '',
+    },
+  }
+}
+
 export function PatientAssessmentWorkflow({
   patients,
-  health,
-  healthError,
   prefillPatient,
-  onRefreshHealth,
+  prefillAssessment = null,
   onAssessmentSaved,
   onCancel,
 }: PatientAssessmentWorkflowProps) {
   const [draft, setDraft] = useState<AssessmentDraft>(() => {
+    if (prefillAssessment) {
+      return createDraftFromAssessment(prefillAssessment)
+    }
     const initial = createEmptyDraft()
     if (prefillPatient) {
       initial.patientInfo.patientMode = 'existing'
@@ -57,13 +136,111 @@ export function PatientAssessmentWorkflow({
   const [submitError, setSubmitError] = useState<string | null>(null)
   const [patientErrors, setPatientErrors] = useState<Record<string, string>>({})
   const [vitalErrors, setVitalErrors] = useState<Record<string, string>>({})
-  const [pimaErrors, setPimaErrors] = useState<
-    Partial<Record<PimaFeatureKey, string>>
-  >({})
+  const [selectedDocumentFiles, setSelectedDocumentFiles] = useState<File[]>([])
+  const [selectedImageFiles, setSelectedImageFiles] = useState<File[]>([])
+  const [imageModality, setImageModality] = useState<'chest_xray' | 'xray'>(() => {
+    const firstImg = prefillAssessment?.attachments?.find((a) => a.kind === 'image')
+    return firstImg?.modality === 'xray' ? 'xray' : 'chest_xray'
+  })
+  const [priorDocumentNames, setPriorDocumentNames] = useState<string[]>(() => {
+    if (!prefillAssessment) return []
+    const attachmentDocs = (prefillAssessment.attachments ?? [])
+      .filter((a) => a.kind === 'document')
+      .map((a) => a.original_filename)
+    return Array.from(
+      new Set([...attachmentDocs, ...(prefillAssessment.attached_report_names ?? [])]),
+    )
+  })
+  const [unavailablePriorImages, setUnavailablePriorImages] = useState<string[]>([])
+  const [restoringPriorImages, setRestoringPriorImages] = useState(false)
 
-  const isDiabetesModelReady = Boolean(
-    health && health.status === 'ready' && !healthError,
-  )
+  useEffect(() => {
+    if (!prefillAssessment) return
+    let active = true
+
+    async function hydratePriorAttachments() {
+      if (!prefillAssessment) return
+      setRestoringPriorImages(true)
+
+      let sourceAssessment = prefillAssessment
+      try {
+        sourceAssessment = await fetchAssessment(prefillAssessment.id)
+      } catch {
+        // Fall back to the assessment record passed from the dashboard if offline/mocked.
+      }
+      if (!active) return
+
+      const attachmentDocs = (sourceAssessment.attachments ?? [])
+        .filter((a) => a.kind === 'document')
+        .map((a) => a.original_filename)
+      setPriorDocumentNames(
+        Array.from(
+          new Set([
+            ...attachmentDocs,
+            ...(sourceAssessment.attached_report_names ?? []),
+          ]),
+        ),
+      )
+
+      const imageAttachments = (sourceAssessment.attachments ?? []).filter(
+        (a) => a.kind === 'image',
+      )
+
+      if (imageAttachments.length === 0) {
+        const legacyImageNames = (sourceAssessment.attached_images ?? []).map(
+          (img) => img.name,
+        )
+        setUnavailablePriorImages(legacyImageNames)
+        setRestoringPriorImages(false)
+        return
+      }
+
+      if (imageAttachments[0]?.modality === 'xray') {
+        setImageModality('xray')
+      } else if (imageAttachments[0]?.modality === 'chest_xray') {
+        setImageModality('chest_xray')
+      }
+
+      const restoredFiles: File[] = []
+      const missingNames: string[] = []
+
+      for (const att of imageAttachments) {
+        const file = await fetchAssessmentAttachmentImageFile(
+          sourceAssessment.id,
+          att,
+        )
+        if (!active) return
+        if (file) {
+          restoredFiles.push(file)
+        } else {
+          missingNames.push(att.original_filename)
+        }
+      }
+
+      if (restoredFiles.length > 0) {
+        setSelectedImageFiles(restoredFiles)
+        setDraft((prev) => ({
+          ...prev,
+          medicalImages: {
+            ...prev.medicalImages,
+            attachedImages: restoredFiles.map((file) => ({
+              name: file.name,
+              size_label: `${Math.max(1, Math.round(file.size / 1024))} KB`,
+              type: file.type || 'image/png',
+            })),
+          },
+        }))
+      }
+      setUnavailablePriorImages(missingNames)
+      setRestoringPriorImages(false)
+    }
+
+    void hydratePriorAttachments()
+
+    return () => {
+      active = false
+    }
+  }, [prefillAssessment])
 
   const liveVitalEvaluation = evaluateClinicalMeasurements(
     draft.clinicalMeasurements,
@@ -80,28 +257,9 @@ export function PatientAssessmentWorkflow({
       ? patients.find((p) => p.id === draft.patientInfo.existingPatientId) ?? null
       : null
 
-  function syncAvailableVitalsToPima() {
-    const dobForAge =
-      draft.patientInfo.patientMode === 'existing'
-        ? selectedExistingPatient?.date_of_birth ?? ''
-        : draft.patientInfo.dateOfBirth
-    const computedAge = computeAgeYears(dobForAge)
-
-    setDraft((prev) => ({
-      ...prev,
-      diabetesFeatures: {
-        ...prev.diabetesFeatures,
-        Age:
-          computedAge !== null ? String(computedAge) : prev.diabetesFeatures.Age,
-        BloodPressure:
-          prev.clinicalMeasurements.diastolicBp.trim() ||
-          prev.diabetesFeatures.BloodPressure,
-      },
-    }))
-  }
-
   function handleReportFilesChange(event: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? [])
+    setSelectedDocumentFiles(files)
     setDraft((prev) => ({
       ...prev,
       medicalRecords: {
@@ -111,8 +269,9 @@ export function PatientAssessmentWorkflow({
     }))
   }
 
-  function handleMedicalImagesChange(event: React.ChangeEvent<HTMLInputElement>) {
+  function handleImageFilesChange(event: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? [])
+    setSelectedImageFiles(files)
     setDraft((prev) => ({
       ...prev,
       medicalImages: {
@@ -120,7 +279,7 @@ export function PatientAssessmentWorkflow({
         attachedImages: files.map((file) => ({
           name: file.name,
           size_label: `${Math.max(1, Math.round(file.size / 1024))} KB`,
-          type: file.type || 'image',
+          type: file.type || 'image/png',
         })),
       },
     }))
@@ -134,13 +293,11 @@ export function PatientAssessmentWorkflow({
     setGeneralError(validation.generalError)
     setPatientErrors(validation.patientErrors)
     setVitalErrors(validation.vitalErrors)
-    setPimaErrors(validation.pimaErrors)
 
     if (
       validation.generalError ||
       Object.keys(validation.patientErrors).length > 0 ||
-      Object.keys(validation.vitalErrors).length > 0 ||
-      Object.keys(validation.pimaErrors).length > 0
+      Object.keys(validation.vitalErrors).length > 0
     ) {
       return
     }
@@ -152,7 +309,7 @@ export function PatientAssessmentWorkflow({
 
     try {
       if (draft.patientInfo.patientMode === 'new') {
-        setProcessingMessage('Persisting new patient identity record...')
+        setProcessingMessage('Saving patient record...')
         newlyCreatedPatient = await createPatient({
           full_name: draft.patientInfo.fullName.trim(),
           date_of_birth: draft.patientInfo.dateOfBirth.trim(),
@@ -163,53 +320,7 @@ export function PatientAssessmentWorkflow({
         resolvedPatientId = newlyCreatedPatient.id
       }
 
-      const unusualWarnings = Object.values(validation.vitalWarnings)
-      const preprocessing = buildPreprocessingSummary(draft, unusualWarnings)
-      let predictiveOutcome: PredictiveExperimentOutcome
-
-      if (!draft.includeDiabetesExperiment) {
-        predictiveOutcome = {
-          executed: false,
-          status: 'not-requested',
-          result: null,
-          message:
-            'The optional Pima diabetes predictive experiment was not selected for this assessment.',
-        }
-      } else if (!isDiabetesModelReady || !validation.parsedPima) {
-        predictiveOutcome = {
-          executed: false,
-          status: 'unavailable',
-          result: null,
-          message:
-            healthError ||
-            health?.detail ||
-            'The diabetes predictive model service is currently unavailable.',
-        }
-      } else {
-        setProcessingMessage('Running Pima predictive experiment via FastAPI...')
-        try {
-          const result = await submitDiabetesPrediction(validation.parsedPima)
-          predictiveOutcome = {
-            executed: true,
-            status: 'completed',
-            result,
-            message: 'Diabetes predictive experiment completed via FastAPI backend.',
-          }
-        } catch (err: unknown) {
-          onRefreshHealth()
-          predictiveOutcome = {
-            executed: false,
-            status: 'error',
-            result: null,
-            message:
-              err instanceof Error
-                ? err.message
-                : 'Predictive model request failed.',
-          }
-        }
-      }
-
-      setProcessingMessage('Saving clinical assessment record to database...')
+      setProcessingMessage('Saving clinical assessment...')
       const parseOptionalNumber = (raw: string): number | undefined => {
         const trimmed = raw.trim()
         return trimmed === '' ? undefined : Number(trimmed)
@@ -248,17 +359,46 @@ export function PatientAssessmentWorkflow({
         ehr_summary: draft.medicalRecords.ehrSummary.trim() || undefined,
         previous_reports: draft.medicalRecords.previousReports.trim() || undefined,
         attached_report_names: draft.medicalRecords.attachedReportNames,
-        attached_images: draft.medicalImages.attachedImages,
         imaging_notes: draft.medicalImages.imagingNotes.trim() || undefined,
-        genomic_notes: draft.genomicInfo.genomicNotes.trim() || undefined,
-        family_history_markers:
-          draft.genomicInfo.familyHistoryMarkers.trim() || undefined,
-        preprocessing_summary: preprocessing,
-        predictive_experiment_result: predictiveOutcome,
         clinician_reviewed: false,
       })
 
-      onAssessmentSaved(savedAssessment, newlyCreatedPatient)
+      const uploadedAttachments: AssessmentAttachmentRecord[] = []
+      if (selectedDocumentFiles.length > 0) {
+        setProcessingMessage('Extracting and storing clinical documents...')
+        const docs = await uploadAssessmentDocuments(
+          savedAssessment.id,
+          selectedDocumentFiles,
+        )
+        uploadedAttachments.push(...docs)
+      }
+      if (selectedImageFiles.length > 0) {
+        setProcessingMessage('Stripping EXIF metadata and storing medical images...')
+        const imgs = await uploadAssessmentImages(
+          savedAssessment.id,
+          selectedImageFiles,
+          imageModality,
+        )
+        uploadedAttachments.push(...imgs)
+      }
+
+      const finalAssessment: ClinicalAssessmentRecord =
+        uploadedAttachments.length > 0
+          ? {
+              ...savedAssessment,
+              attachments: uploadedAttachments,
+              attached_report_names: [
+                ...new Set([
+                  ...savedAssessment.attached_report_names,
+                  ...uploadedAttachments
+                    .filter((a) => a.kind === 'document')
+                    .map((a) => a.original_filename),
+                ]),
+              ],
+            }
+          : savedAssessment
+
+      onAssessmentSaved(finalAssessment, newlyCreatedPatient)
     } catch (err: unknown) {
       setStage('intake')
       setProcessingMessage('')
@@ -301,39 +441,35 @@ export function PatientAssessmentWorkflow({
 
       {stage === 'processing' ? (
         <section className="panel processing-panel" aria-live="polite">
-          <h2>Running Integrated Healthcare Analysis Pipeline…</h2>
+          <h2>Saving Clinical Assessment…</h2>
           <p className="processing-status-text">{processingMessage}</p>
-          <ul className="pipeline-status-list">
-            <li>
-              <strong>Component 1 — Data Analysis &amp; Preprocessing:</strong>{' '}
-              Validating entered clinical fields and persisting structured intake.
-            </li>
-            <li>
-              <strong>Component 2 — GenAI-Based Diagnosis:</strong>{' '}
-              {draft.includeDiabetesExperiment
-                ? 'Running optional Pima predictive experiment via FastAPI…'
-                : 'Recording assessment without optional Pima diabetes screening.'}
-            </li>
-            <li>
-              <strong>Component 3 — Decision Support &amp; Privacy:</strong> Keeping
-              patient identity separate from clinical observations in PostgreSQL.
-            </li>
-          </ul>
         </section>
       ) : (
         <form onSubmit={handleAnalyzeSubmit} className="intake-form" noValidate>
           <div className="intake-intro-bar">
             <div>
-              <h2>New Patient Assessment</h2>
+              <span className="section-kicker">
+                {prefillAssessment ? 'Re-assessment' : 'Patient Input'}
+              </span>
+              <h2>New Healthcare Analysis</h2>
               <p>
-                Select an existing patient or register a new patient, then enter available
-                clinical information. Only provided modalities are stored.
+                Enter patient details, symptoms, history, and vital measurements.
               </p>
             </div>
             <button type="button" className="btn-secondary" onClick={onCancel}>
               Cancel
             </button>
           </div>
+
+          {prefillAssessment && (
+            <div className="alert alert-info" role="status">
+              <strong>Re-assessing from saved assessment</strong> (
+              {new Date(prefillAssessment.created_at).toLocaleDateString()}).
+              Available clinical details have been pre-populated. Saving will
+              create a new assessment linked to this patient and preserve the
+              original record.
+            </div>
+          )}
 
           {submitError && (
             <div className="alert alert-error" role="alert">
@@ -347,7 +483,9 @@ export function PatientAssessmentWorkflow({
             </div>
           )}
 
-          {/* Section A */}
+          <div className="intake-workspace-grid">
+            <div className="intake-main-column">
+              {/* Section A */}
           <section className="panel intake-section" aria-labelledby="sec-a-heading">
             <div className="section-header-inline">
               <h3 id="sec-a-heading">A. Patient Information</h3>
@@ -724,9 +862,9 @@ export function PatientAssessmentWorkflow({
           <section className="panel intake-section" aria-labelledby="sec-c-heading">
             <h3 id="sec-c-heading">C. Clinical Measurements</h3>
             <p className="modality-note">
-              Enter measurements using the indicated units. Broad technical entry limits
-              allow unusual or critical clinical readings to be recorded; unusual values
-              display a non-blocking warning while physically invalid values are rejected.
+              Optional — enter values from healthcare records, clinical devices, or
+              authorized manual entry using the indicated units. Unusual readings display a
+              non-blocking warning while physically invalid values are rejected.
             </p>
 
             {warningMessages.length > 0 && (
@@ -990,15 +1128,10 @@ export function PatientAssessmentWorkflow({
             </div>
           </section>
 
-          {/* Section D, E, F */}
-          <div className="modalities-grid">
-            <section className="panel intake-section" aria-labelledby="sec-d-heading">
-              <h3 id="sec-d-heading">D. Medical Records and Reports</h3>
-              <p className="modality-note">
-                Stores entered laboratory/EHR text and uploaded report file metadata
-                (file names only). Automated report parsing, text extraction, and document
-                analysis are not yet implemented.
-              </p>
+          {/* Section D: Clinical Notes & Records (Optional) */}
+          <section className="panel intake-section" aria-labelledby="sec-d-heading">
+            <h3 id="sec-d-heading">D. Clinical Notes &amp; Records (Optional)</h3>
+            <div className="fields-grid">
               <div className="field-group">
                 <label htmlFor="mr-labs" className="field-label">
                   <span>Laboratory Results</span>
@@ -1006,7 +1139,7 @@ export function PatientAssessmentWorkflow({
                 <textarea
                   id="mr-labs"
                   rows={2}
-                  placeholder="CBC, metabolic panel, lipid profile, HbA1c..."
+                  placeholder="Enter from lab reports or healthcare records (e.g., CBC, WBC, CRP, HbA1c)..."
                   value={draft.medicalRecords.labResults}
                   onChange={(e) =>
                     setDraft((prev) => ({
@@ -1022,12 +1155,12 @@ export function PatientAssessmentWorkflow({
 
               <div className="field-group">
                 <label htmlFor="mr-ehr" className="field-label">
-                  <span>Electronic Health Records / Previous Reports</span>
+                  <span>Previous Clinical Notes / EHR Summary</span>
                 </label>
                 <textarea
                   id="mr-ehr"
                   rows={2}
-                  placeholder="EHR notes or summary of prior clinical reports..."
+                  placeholder="Summary of prior clinical notes or reports..."
                   value={draft.medicalRecords.ehrSummary}
                   onChange={(e) =>
                     setDraft((prev) => ({
@@ -1040,235 +1173,202 @@ export function PatientAssessmentWorkflow({
                   }
                 />
               </div>
+            </div>
 
+            <div className="field-group">
+              <label htmlFor="mr-files" className="field-label">
+                <span>Upload Clinical Reports / EHR Files (Optional)</span>
+                <span className="field-unit">PDF, TXT, MD, CSV, JSON</span>
+              </label>
+              <input
+                id="mr-files"
+                type="file"
+                multiple
+                accept=".pdf,.txt,.md,.markdown,.csv,.json"
+                onChange={handleReportFilesChange}
+              />
+              <span className="help-text">
+                Readable text is extracted, PII-filtered, and combined into the AI diagnostic
+                analysis.
+              </span>
+              {draft.medicalRecords.attachedReportNames.length > 0 && (
+                <span className="help-text">
+                  Selected: {draft.medicalRecords.attachedReportNames.join(', ')}
+                </span>
+              )}
+              {priorDocumentNames.length > 0 && (
+                <span className="help-text">
+                  Previous assessment document reference(s):{' '}
+                  {priorDocumentNames.join(', ')} — re-upload file(s) above if
+                  needed for fresh extraction.
+                </span>
+              )}
+            </div>
+          </section>
+
+          {/* Section E: Medical Image Input (Optional — Chest / X-Ray) */}
+          <section className="panel intake-section" aria-labelledby="sec-e-heading">
+            <h3 id="sec-e-heading">E. Medical Image Input (Optional — Chest / X-Ray)</h3>
+            <div className="fields-grid">
               <div className="field-group">
-                <label htmlFor="mr-files" className="field-label">
-                  <span>Attach Report Files (Metadata Only)</span>
-                  <span className="field-unit">not parsed</span>
+                <label htmlFor="mi-modality" className="field-label">
+                  <span>Image Modality</span>
                 </label>
-                <input
-                  id="mr-files"
-                  type="file"
-                  multiple
-                  accept=".pdf,.txt,.csv,.json"
-                  onChange={handleReportFilesChange}
-                />
-                {draft.medicalRecords.attachedReportNames.length > 0 && (
-                  <span className="help-text">
-                    File metadata recorded (content not extracted):{' '}
-                    {draft.medicalRecords.attachedReportNames.join(', ')}
-                  </span>
-                )}
+                <select
+                  id="mi-modality"
+                  value={imageModality}
+                  onChange={(e) =>
+                    setImageModality(e.target.value as 'chest_xray' | 'xray')
+                  }
+                >
+                  <option value="chest_xray">Chest X-Ray</option>
+                  <option value="xray">Other X-Ray</option>
+                </select>
+                <span className="help-text">
+                  MRI and CT volumetric formats are not yet supported.
+                </span>
               </div>
-            </section>
 
-            <section className="panel intake-section" aria-labelledby="sec-e-heading">
-              <h3 id="sec-e-heading">E. Medical Images (Optional)</h3>
-              <p className="modality-note">
-                Persists image file metadata references in the assessment record. Automated
-                medical image analysis is not operational yet.
-              </p>
               <div className="field-group">
                 <label htmlFor="mi-files" className="field-label">
-                  <span>Attach Medical Images (Metadata Only)</span>
-                  <span className="field-unit">optional</span>
+                  <span>Upload Medical Image</span>
+                  <span className="field-unit">PNG / JPEG (max 10 MB)</span>
                 </label>
                 <input
                   id="mi-files"
                   type="file"
                   multiple
-                  accept="image/*,.dcm"
-                  onChange={handleMedicalImagesChange}
+                  accept=".png,.jpg,.jpeg,image/png,image/jpeg"
+                  onChange={handleImageFilesChange}
                 />
-                {draft.medicalImages.attachedImages.length > 0 && (
-                  <ul className="attached-file-list">
-                    {draft.medicalImages.attachedImages.map((img) => (
-                      <li key={img.name}>
-                        {img.name} ({img.size_label})
-                      </li>
-                    ))}
-                  </ul>
+                <span className="help-text">
+                  EXIF metadata is stripped automatically before AI vision observation.
+                </span>
+                {restoringPriorImages && (
+                  <span className="help-text">
+                    Checking prior assessment medical image(s)…
+                  </span>
+                )}
+                {selectedImageFiles.length > 0 && (
+                  <span className="help-text">
+                    Selected: {selectedImageFiles.map((f) => f.name).join(', ')}
+                  </span>
+                )}
+                {unavailablePriorImages.length > 0 && (
+                  <span className="warning-text" role="status">
+                    Previous image(s) no longer available and need to be uploaded
+                    again: {unavailablePriorImages.join(', ')}.
+                  </span>
                 )}
               </div>
-
-              <div className="field-group">
-                <label htmlFor="mi-notes" className="field-label">
-                  <span>Imaging Notes / Modality</span>
-                  <span className="field-unit">optional</span>
-                </label>
-                <input
-                  id="mi-notes"
-                  type="text"
-                  placeholder="e.g., Chest X-ray, MRI study notes"
-                  value={draft.medicalImages.imagingNotes}
-                  onChange={(e) =>
-                    setDraft((prev) => ({
-                      ...prev,
-                      medicalImages: {
-                        ...prev.medicalImages,
-                        imagingNotes: e.target.value,
-                      },
-                    }))
-                  }
-                />
-              </div>
-            </section>
-
-            <section className="panel intake-section" aria-labelledby="sec-f-heading">
-              <h3 id="sec-f-heading">F. Genomic Information (Optional)</h3>
-              <p className="modality-note">
-                Optional input slot storing genomic reference notes in the assessment
-                schema. Automated genomic variant analysis is not operational yet.
-              </p>
-              <div className="field-group">
-                <label htmlFor="gi-markers" className="field-label">
-                  <span>Family / Genetic Risk Context</span>
-                </label>
-                <input
-                  id="gi-markers"
-                  type="text"
-                  placeholder="Relevant hereditary history or marker notes..."
-                  value={draft.genomicInfo.familyHistoryMarkers}
-                  onChange={(e) =>
-                    setDraft((prev) => ({
-                      ...prev,
-                      genomicInfo: {
-                        ...prev.genomicInfo,
-                        familyHistoryMarkers: e.target.value,
-                      },
-                    }))
-                  }
-                />
-              </div>
-
-              <div className="field-group">
-                <label htmlFor="gi-notes" className="field-label">
-                  <span>Genomic Report Reference</span>
-                </label>
-                <textarea
-                  id="gi-notes"
-                  rows={2}
-                  placeholder="Optional reference to external genomic test summary..."
-                  value={draft.genomicInfo.genomicNotes}
-                  onChange={(e) =>
-                    setDraft((prev) => ({
-                      ...prev,
-                      genomicInfo: {
-                        ...prev.genomicInfo,
-                        genomicNotes: e.target.value,
-                      },
-                    }))
-                  }
-                />
-              </div>
-            </section>
-          </div>
-
-          {/* Optional Disease-Specific Predictive AI Experiment */}
-          <section
-            className="panel intake-section experiment-optin-panel"
-            aria-labelledby="optin-pima-heading"
-          >
-            <div className="optin-header">
-              <div>
-                <h3 id="optin-pima-heading">
-                  Optional Predictive AI Screening: Pima Diabetes XGBoost Experiment
-                </h3>
-                <p>
-                  Include our existing disease-specific 8-feature Pima predictive model
-                  during AI analysis. This is one targeted research model—not the general
-                  patient assessment form.
-                </p>
-              </div>
-              <label className="checkbox-toggle">
-                <input
-                  type="checkbox"
-                  checked={draft.includeDiabetesExperiment}
-                  onChange={(e) =>
-                    setDraft((prev) => ({
-                      ...prev,
-                      includeDiabetesExperiment: e.target.checked,
-                    }))
-                  }
-                />
-                <span>Include Diabetes Predictive Experiment</span>
-              </label>
             </div>
 
-            {draft.includeDiabetesExperiment && (
-              <div className="optin-body">
-                <div className="optin-toolbar">
-                  <span className="help-text">
-                    Model status:{' '}
-                    <strong>
-                      {isDiabetesModelReady
-                        ? 'Ready (POST /api/v1/predictions/diabetes)'
-                        : 'Unavailable (assessment will still save and mark this model unavailable)'}
-                    </strong>
-                  </span>
-                  <button
-                    type="button"
-                    className="btn-secondary btn-xs"
-                    onClick={syncAvailableVitalsToPima}
-                  >
-                    Sync Age &amp; Diastolic BP from Intake
-                  </button>
-                </div>
-
-                <div className="fields-grid fields-grid-4">
-                  {PIMA_FEATURE_FIELDS.map((field) => {
-                    const error = pimaErrors[field.key]
-                    const inputId = `intake-pima-${field.key}`
-                    return (
-                      <div key={field.key} className="field-group">
-                        <label htmlFor={inputId} className="field-label">
-                          <span>{field.label}</span>
-                          <span className="field-unit">{field.unit}</span>
-                        </label>
-                        <input
-                          id={inputId}
-                          type="number"
-                          min={field.min}
-                          max={field.max}
-                          step={field.step}
-                          value={draft.diabetesFeatures[field.key]}
-                          onChange={(e) =>
-                            setDraft((prev) => ({
-                              ...prev,
-                              diabetesFeatures: {
-                                ...prev.diabetesFeatures,
-                                [field.key]: e.target.value,
-                              },
-                            }))
-                          }
-                          placeholder={
-                            field.zeroAsMissing && field.plausibleMin !== undefined
-                              ? `0 or ${field.plausibleMin}–${field.max}`
-                              : `${field.min}–${field.max}`
-                          }
-                          className={error ? 'input-error' : undefined}
-                        />
-                        {error ? (
-                          <span className="error-text">{error}</span>
-                        ) : (
-                          <span className="help-text">{field.hint}</span>
-                        )}
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-            )}
+            <div className="field-group">
+              <label htmlFor="mi-notes" className="field-label">
+                <span>Imaging Context Notes (Optional)</span>
+              </label>
+              <input
+                id="mi-notes"
+                type="text"
+                placeholder="e.g., Portable PA chest X-ray taken after 3 days of fever and cough"
+                value={draft.medicalImages.imagingNotes}
+                onChange={(e) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    medicalImages: {
+                      ...prev.medicalImages,
+                      imagingNotes: e.target.value,
+                    },
+                  }))
+                }
+              />
+            </div>
           </section>
 
           <div className="submit-bar">
             <button type="submit" className="btn-primary btn-lg">
-              Save &amp; Run Integrated AI Assessment →
+              Save &amp; Continue to Diagnostic Output →
             </button>
             <span className="submit-note">
-              Patient identity and clinical assessment are persisted separately in
-              PostgreSQL. All outputs require clinician review.
+              Saved securely in PostgreSQL. Diagnostic output requires clinician review.
             </span>
+          </div>
+            </div>
+
+            {/* Digcy-Inspired Clinical Profile & Live Anatomy Sidebar */}
+            <aside className="intake-summary-aside" aria-label="Live patient profile preview">
+              <div className="panel clinical-profile-preview">
+                <div className="clinical-profile-head">
+                  <div className="patient-monogram" aria-hidden="true">
+                    {(
+                      (selectedExistingPatient
+                        ? selectedExistingPatient.full_name
+                        : draft.patientInfo.fullName
+                      ).trim() || 'P'
+                    )
+                      .slice(0, 2)
+                      .toUpperCase()}
+                  </div>
+                  <div>
+                    <span className="section-kicker">Patient Profile</span>
+                    <h3>
+                      {(selectedExistingPatient
+                        ? selectedExistingPatient.full_name
+                        : draft.patientInfo.fullName
+                      ).trim() || 'New Patient Entry'}
+                    </h3>
+                    <p className="clinical-profile-meta">
+                      {(selectedExistingPatient
+                        ? selectedExistingPatient.sex
+                        : draft.patientInfo.sex
+                      ) || 'Sex unspecified'}
+                      {' · '}
+                      DOB:{' '}
+                      {(selectedExistingPatient
+                        ? selectedExistingPatient.date_of_birth
+                        : draft.patientInfo.dateOfBirth
+                      ) || 'Not entered'}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="live-vitals-chips" aria-label="Entered measurements summary">
+                  <div className="vital-chip">
+                    <span>Blood Pressure</span>
+                    <strong>
+                      {draft.clinicalMeasurements.systolicBp ||
+                      draft.clinicalMeasurements.diastolicBp
+                        ? `${draft.clinicalMeasurements.systolicBp || '—'}/${draft.clinicalMeasurements.diastolicBp || '—'} mm Hg`
+                        : 'Not entered'}
+                    </strong>
+                  </div>
+                  <div className="vital-chip">
+                    <span>Heart Rate</span>
+                    <strong>
+                      {draft.clinicalMeasurements.heartRate
+                        ? `${draft.clinicalMeasurements.heartRate} bpm`
+                        : 'Not entered'}
+                    </strong>
+                  </div>
+                  <div className="vital-chip">
+                    <span>Temperature</span>
+                    <strong>
+                      {draft.clinicalMeasurements.bodyTemperature
+                        ? `${draft.clinicalMeasurements.bodyTemperature} °C`
+                        : 'Not entered'}
+                    </strong>
+                  </div>
+                  <div className="vital-chip">
+                    <span>SpO₂</span>
+                    <strong>
+                      {draft.clinicalMeasurements.oxygenSaturation
+                        ? `${draft.clinicalMeasurements.oxygenSaturation}%`
+                        : 'Not entered'}
+                    </strong>
+                  </div>
+                </div>
+              </div>
+            </aside>
           </div>
         </form>
       )}

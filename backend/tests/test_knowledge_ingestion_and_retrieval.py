@@ -519,3 +519,4 @@ def test_knowledge_api_ingestion_dedup_listing_status_and_errors(
     knowledge_api.document_ingestion_service._settings_override = None
     knowledge_api.embedding_service._settings_override = None
     assert KnowledgeDocument is not None
+

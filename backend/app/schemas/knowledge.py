@@ -72,3 +72,4 @@ class RetrievalResult(BaseModel):
     total_chunks_searched: int
     retrieved_chunks: list[RetrievedChunkItem] = Field(default_factory=list)
     message: str
+

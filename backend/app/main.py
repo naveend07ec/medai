@@ -11,6 +11,7 @@ from app.api.v1.health import router as health_router
 from app.api.v1.knowledge import router as knowledge_router
 from app.api.v1.patients import router as patients_router
 from app.api.v1.predictions import router as predictions_router
+from app.api.v1.rag import router as rag_router
 from app.core.config import settings
 from app.core.database import DatabaseNotConfiguredError
 from app.services.predictive_ai import load_diabetes_predictor
@@ -105,6 +106,10 @@ app.include_router(
 )
 app.include_router(
     predictions_router,
+    prefix="/api/v1",
+)
+app.include_router(
+    rag_router,
     prefix="/api/v1",
 )
 

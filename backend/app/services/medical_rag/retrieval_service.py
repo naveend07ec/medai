@@ -155,3 +155,4 @@ class KnowledgeRetrievalService:
 
 
 retrieval_service = KnowledgeRetrievalService()
+

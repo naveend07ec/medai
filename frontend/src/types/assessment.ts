@@ -3,12 +3,7 @@ import type {
   DiabetesPredictionResponse,
 } from './prediction'
 
-export type AppRoute =
-  | 'dashboard'
-  | 'new-assessment'
-  | 'patient-records'
-  | 'assessment-history'
-  | 'research-info'
+export type AppRoute = 'dashboard' | 'new-assessment' | 'knowledge-base'
 
 export interface PatientRecord {
   id: string
@@ -52,42 +47,101 @@ export interface PredictiveExperimentOutcome {
 
 export interface DiagnosticConsideration {
   condition_or_pattern: string
+  plain_language_explanation?: string | null
+  why_findings_point_here?: string | null
   supporting_observed_evidence: string[]
+  cited_chunk_ids: string[]
   rationale: string
   uncertainty_note: string
 }
 
-export interface MedicalReferenceItem {
-  title: string
-  source: string
-  guideline_or_citation: string
-  relevance_note: string
+export interface FindingExplanation {
+  finding_name: string
+  observed_value: string
+  reference_range_note: string
+  status_flag:
+    | 'within_range'
+    | 'outside_range'
+    | 'reported_symptom'
+    | 'needs_confirmation'
+  plain_language_meaning: string
+  why_it_matters: string
 }
 
-export interface TreatmentSupportSection {
+export interface RetrievedSourceItem {
+  chunk_id: string
+  document_id: string
+  document_title: string
+  source_publisher: string
+  publication_date: string | null
+  source_url: string | null
+  section_heading: string | null
+  page_number: number | null
+  similarity_score: number
+  excerpt: string
+}
+
+export interface TreatmentAndManagementSection {
   grounded_in_verified_references: boolean
-  retrieved_references: MedicalReferenceItem[]
   guidance_items: string[]
+  cited_chunk_ids: string[]
   status_note: string
+  clinician_review_required: boolean
+}
+
+export interface EmergencyAlert {
+  emergency_detected: boolean
+  urgency_level: 'emergency' | 'standard'
+  matched_patterns: string[]
+  emergency_guidance: string | null
+  triage_disclaimer: string
 }
 
 export interface PredictiveExperimentReference {
   included: boolean
   module_name: string | null
   summary: string
+  limitations: string
+}
+
+export interface DocumentExtractionSummary {
+  file_name: string
+  extraction_status: string
+  summary_note: string | null
+  extracted_excerpt: string | null
+}
+
+export interface MedicalImageObservation {
+  image_name: string
+  modality: string
+  processing_status: 'analyzed' | 'unreadable' | 'not_provided'
+  visibly_observed: string[]
+  possible_indications: string[]
+  uncertainties: string[]
+  clinician_verification_needed: string
+  limitation_note: string
 }
 
 export interface DiagnosticReportContent {
-  patient_clinical_summary: string
-  available_clinical_findings: string[]
-  ai_generated_diagnostic_insights: string
+  patient_context_summary: string
+  relevant_clinical_findings: string[]
+  finding_explanations?: FindingExplanation[]
+  extracted_document_summaries?: DocumentExtractionSummary[]
+  image_observations?: MedicalImageObservation[]
   possible_diagnostic_considerations: DiagnosticConsideration[]
-  missing_information_and_uncertainty: string[]
-  further_clinical_evaluation_considerations: string[]
-  personalized_treatment_support: TreatmentSupportSection
-  clinician_review_and_safety_disclaimer: string
-  predictive_model_separation_note: PredictiveExperimentReference
+  supporting_medical_evidence: string
+  additional_information_required: string[]
+  doctor_discussion_points?: string[]
+  risk_indicators_and_safety_warnings: string[]
+  treatment_and_management_information: TreatmentAndManagementSection
+  clinical_limitations: string[]
+  retrieved_sources: RetrievedSourceItem[]
+  emergency_alert: EmergencyAlert
+  evidence_sufficient: boolean
+  generated_by_gemini: boolean
+  predictive_ml_output: PredictiveExperimentReference
   research_context_note: string
+  clinician_review_disclaimer: string
 }
 
 export interface DiagnosticReportRecord {
@@ -107,8 +161,77 @@ export interface GenAIHealthStatus {
   status: 'ready' | 'unavailable'
   provider: string
   model_name: string
+  embedding_model: string
   rag_connected: boolean
+  indexed_documents: number
+  indexed_chunks: number
+  demo_mode: boolean
   detail: string | null
+}
+
+export interface RagQueryRequest {
+  question: string
+  clinical_context?: string
+  top_k?: number
+  min_similarity?: number
+}
+
+export interface RagQueryResponse {
+  status: 'completed' | 'emergency_warning_only'
+  generated_by_gemini: boolean
+  gemini_available: boolean
+  provider: string
+  model_name: string
+  emergency_alert: EmergencyAlert
+  report: DiagnosticReportContent | null
+  notice: string | null
+}
+
+export interface KnowledgeDocumentRecord {
+  id: string
+  title: string
+  source_publisher: string
+  publication_date: string | null
+  source_url: string | null
+  file_name: string | null
+  content_type: string | null
+  content_hash: string
+  chunk_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface KnowledgeDocumentIngestResponse {
+  document: KnowledgeDocumentRecord
+  chunks_created: number
+  embedding_model: string
+  embedding_dimension: number
+}
+
+export interface KnowledgeBaseStatus {
+  vector_store_backend: string
+  document_count: number
+  chunk_count: number
+  embedding_model: string
+  embedding_dimension: number
+  embedding_service_ready: boolean
+  top_k_default: number
+  min_similarity_default: number
+}
+
+export interface AssessmentAttachmentRecord {
+  id: string
+  assessment_id: string
+  kind: 'document' | 'image' | string
+  original_filename: string
+  mime_type: string
+  size_bytes: number
+  modality: string
+  extraction_status: string
+  extracted_text: string | null
+  extraction_note: string | null
+  exif_stripped: boolean
+  created_at: string
 }
 
 export interface ClinicalAssessmentRecord {
@@ -140,6 +263,7 @@ export interface ClinicalAssessmentRecord {
   created_at: string
   updated_at: string
   patient: PatientRecord | null
+  attachments?: AssessmentAttachmentRecord[]
 }
 
 export interface ClinicalAssessmentCreatePayload {
@@ -160,12 +284,12 @@ export interface ClinicalAssessmentCreatePayload {
   ehr_summary?: string
   previous_reports?: string
   attached_report_names: string[]
-  attached_images: AttachedImageMetadata[]
+  attached_images?: AttachedImageMetadata[]
   imaging_notes?: string
   genomic_notes?: string
   family_history_markers?: string
-  preprocessing_summary: PreprocessingSummary
-  predictive_experiment_result: PredictiveExperimentOutcome
+  preprocessing_summary?: PreprocessingSummary | null
+  predictive_experiment_result?: PredictiveExperimentOutcome | null
   clinician_reviewed: boolean
 }
 

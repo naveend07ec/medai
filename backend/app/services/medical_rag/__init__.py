@@ -12,11 +12,11 @@ from app.services.medical_rag.embedding_service import (
     GeminiEmbeddingService,
     embedding_service,
 )
+from app.services.medical_rag.rag_service import RAGPipelineResult, RAGService, rag_service
 from app.services.medical_rag.retrieval_service import (
     KnowledgeRetrievalService,
     retrieval_service,
 )
-from app.services.medical_rag.retriever import retrieve_verified_medical_references
 
 __all__ = [
     "DocumentIngestionError",
@@ -28,8 +28,10 @@ __all__ = [
     "EmbeddingTimeoutError",
     "GeminiEmbeddingService",
     "KnowledgeRetrievalService",
+    "RAGPipelineResult",
+    "RAGService",
     "document_ingestion_service",
     "embedding_service",
+    "rag_service",
     "retrieval_service",
-    "retrieve_verified_medical_references",
 ]

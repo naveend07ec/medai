@@ -181,3 +181,4 @@ def list_knowledge_documents(
     )
     rows = db.execute(stmt).all()
     return [_to_document_response(doc, int(count)) for doc, count in rows]
+

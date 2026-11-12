@@ -132,6 +132,25 @@ class ClinicalAssessmentReviewUpdate(BaseModel):
     clinician_reviewed: bool
 
 
+class AssessmentAttachmentResponse(BaseModel):
+    """Metadata and extraction status for an uploaded clinical document or image."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    assessment_id: UUID
+    kind: str
+    original_filename: str
+    mime_type: str
+    size_bytes: int
+    modality: str
+    extraction_status: str
+    extracted_text: Optional[str] = None
+    extraction_note: Optional[str] = None
+    exif_stripped: bool = False
+    created_at: datetime
+
+
 class ClinicalAssessmentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -171,4 +190,5 @@ class ClinicalAssessmentResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     patient: Optional[PatientResponse] = None
+    attachments: list[AssessmentAttachmentResponse] = Field(default_factory=list)
 

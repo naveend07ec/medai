@@ -1,33 +1,25 @@
 import { useCallback, useEffect, useState } from 'react'
-import { fetchAssessments, fetchPatients } from './api/clinical'
-import { fetchDiabetesModelHealth } from './api/predictions'
+import { fetchAssessments, fetchGenAIHealth, fetchPatients } from './api/clinical'
 import './App.css'
-import { AssessmentHistoryView } from './components/AssessmentHistoryView'
 import { AssessmentResultsView } from './components/AssessmentResultsView'
 import { DashboardHome } from './components/DashboardHome'
+import { KnowledgeBaseView } from './components/KnowledgeBaseView'
+import { MedAiWordmark } from './components/MedAiWordmark'
 import { PatientAssessmentWorkflow } from './components/PatientAssessmentWorkflow'
-import { PatientRecordsView } from './components/PatientRecordsView'
-import { ResearchInformationView } from './components/ResearchInformationView'
 import type {
   AppRoute,
   ClinicalAssessmentRecord,
+  GenAIHealthStatus,
   PatientRecord,
 } from './types/assessment'
-import type {
-  DiabetesPredictionResponse,
-  PredictiveModelHealth,
-} from './types/prediction'
 
 const PRIMARY_NAV_ITEMS: Array<{
   id: AppRoute
   label: string
-  secondary?: boolean
 }> = [
   { id: 'dashboard', label: 'Dashboard' },
-  { id: 'new-assessment', label: 'New Patient Assessment' },
-  { id: 'patient-records', label: 'Patient Records' },
-  { id: 'assessment-history', label: 'Assessment History' },
-  { id: 'research-info', label: 'Research Information', secondary: true },
+  { id: 'new-assessment', label: 'New Analysis' },
+  { id: 'knowledge-base', label: 'Knowledge Base' },
 ]
 
 function App() {
@@ -38,14 +30,13 @@ function App() {
   const [recordsError, setRecordsError] = useState<string | null>(null)
 
   const [activeAssessmentId, setActiveAssessmentId] = useState<string | null>(null)
-  const [justSavedBanner, setJustSavedBanner] = useState<string | null>(null)
   const [prefillPatient, setPrefillPatient] = useState<PatientRecord | null>(null)
+  const [prefillAssessment, setPrefillAssessment] =
+    useState<ClinicalAssessmentRecord | null>(null)
+  const [justSavedBanner, setJustSavedBanner] = useState<string | null>(null)
 
-  const [health, setHealth] = useState<PredictiveModelHealth | null>(null)
-  const [healthError, setHealthError] = useState<string | null>(null)
-  const [checkingHealth, setCheckingHealth] = useState(true)
-  const [standalonePredictionResult, setStandalonePredictionResult] =
-    useState<DiabetesPredictionResponse | null>(null)
+  const [genaiHealth, setGenaiHealth] = useState<GenAIHealthStatus | null>(null)
+  const [genaiHealthError, setGenaiHealthError] = useState<string | null>(null)
 
   const loadClinicalRecords = useCallback(async (showSpinner: boolean) => {
     if (showSpinner) {
@@ -66,32 +57,24 @@ function App() {
           : 'Unable to load patient and assessment records from the database.',
       )
     } finally {
-      setLoadingRecords(false)
-    }
-  }, [])
-
-  const applyHealthCheck = useCallback(async (showSpinner: boolean) => {
-    if (showSpinner) {
-      setCheckingHealth(true)
-    }
-    try {
-      const status = await fetchDiabetesModelHealth()
-      setHealth(status)
-      setHealthError(null)
-      if (status.status !== 'ready') {
-        setStandalonePredictionResult(null)
+      if (showSpinner) {
+        setLoadingRecords(false)
       }
-    } catch (err: unknown) {
-      setHealth(null)
-      setStandalonePredictionResult(null)
-      setHealthError(
-        err instanceof Error
-          ? err.message
-          : 'Unable to reach predictive model health check.',
-      )
-    } finally {
-      setCheckingHealth(false)
     }
+
+    fetchGenAIHealth()
+      .then((status) => {
+        setGenaiHealth(status)
+        setGenaiHealthError(null)
+      })
+      .catch((err: unknown) => {
+        setGenaiHealth(null)
+        setGenaiHealthError(
+          err instanceof Error
+            ? err.message
+            : 'Unable to reach Clinical AI health check.',
+        )
+      })
   }, [])
 
   useEffect(() => {
@@ -118,29 +101,20 @@ function App() {
         }
       })
 
-    fetchDiabetesModelHealth()
+    fetchGenAIHealth()
       .then((status) => {
         if (!active) return
-        setHealth(status)
-        setHealthError(null)
-        if (status.status !== 'ready') {
-          setStandalonePredictionResult(null)
-        }
+        setGenaiHealth(status)
+        setGenaiHealthError(null)
       })
       .catch((err: unknown) => {
         if (!active) return
-        setHealth(null)
-        setStandalonePredictionResult(null)
-        setHealthError(
+        setGenaiHealth(null)
+        setGenaiHealthError(
           err instanceof Error
             ? err.message
-            : 'Unable to reach predictive model health check.',
+            : 'Unable to reach Clinical AI health check.',
         )
-      })
-      .finally(() => {
-        if (active) {
-          setCheckingHealth(false)
-        }
       })
 
     return () => {
@@ -148,16 +122,16 @@ function App() {
     }
   }, [])
 
-  const handleRefreshHealth = useCallback(() => {
-    void applyHealthCheck(true)
-  }, [applyHealthCheck])
-
   const handleRefreshRecords = useCallback(() => {
     void loadClinicalRecords(true)
   }, [loadClinicalRecords])
 
-  function handleStartNewAssessment(patient?: PatientRecord) {
-    setPrefillPatient(patient ?? null)
+  function handleStartNewAssessment(
+    patient?: PatientRecord,
+    sourceAssessment?: ClinicalAssessmentRecord,
+  ) {
+    setPrefillPatient(patient ?? sourceAssessment?.patient ?? null)
+    setPrefillAssessment(sourceAssessment ?? null)
     setActiveAssessmentId(null)
     setJustSavedBanner(null)
     setActiveRoute('new-assessment')
@@ -172,13 +146,14 @@ function App() {
     }
     setAssessments((prev) => [savedAssessment, ...prev])
     setPrefillPatient(null)
+    setPrefillAssessment(null)
     setActiveAssessmentId(savedAssessment.id)
     setJustSavedBanner(
       createdPatient
-        ? `Registered patient ${createdPatient.full_name} (${createdPatient.patient_code}) and saved clinical assessment.`
-        : 'Clinical assessment saved to database.',
+        ? `Saved patient ${createdPatient.full_name} and clinical assessment.`
+        : 'Clinical assessment saved.',
     )
-    setActiveRoute('assessment-history')
+    setActiveRoute('dashboard')
   }
 
   function handleAssessmentUpdated(updated: ClinicalAssessmentRecord) {
@@ -190,64 +165,53 @@ function App() {
   function handleViewAssessmentResult(assessmentId: string) {
     setJustSavedBanner(null)
     setActiveAssessmentId(assessmentId)
-    setActiveRoute('assessment-history')
+    setActiveRoute('dashboard')
   }
 
   function handleSelectRoute(route: AppRoute) {
     if (route === 'new-assessment') {
       setPrefillPatient(null)
+      setPrefillAssessment(null)
     }
     setJustSavedBanner(null)
     setActiveAssessmentId(null)
     setActiveRoute(route)
   }
 
-  const activeAssessment = activeAssessmentId
-    ? assessments.find((item) => item.id === activeAssessmentId) ?? null
-    : null
+  const activeAssessment =
+    activeAssessmentId !== null
+      ? assessments.find((item) => item.id === activeAssessmentId) ?? null
+      : null
 
   return (
     <div className="app-shell">
       <header className="platform-header">
         <div className="header-inner">
-          <div className="header-identity">
-            <div className="project-meta-row">
-              <span className="project-code-badge">Project Code: 27CSPS028</span>
-              <span className="academic-tag">Healthcare Decision-Support Platform</span>
-            </div>
-            <h1>Healthcare GenAI Platform</h1>
-            <p className="project-subtitle">
-              Reimagining Healthcare with Generative AI: Personalized Diagnosis and Treatment
-            </p>
-            <p className="header-description">
-              A privacy-aware healthcare application integrating clinical intake,
-              data preprocessing, predictive and generative AI analysis, and
-              clinician-reviewed treatment support.
-            </p>
+          <div className="header-topbar">
+            <button
+              type="button"
+              className="header-brand-btn"
+              onClick={() => handleSelectRoute('dashboard')}
+              aria-label="MedAI Home"
+            >
+              <MedAiWordmark />
+            </button>
+            <nav className="primary-nav" aria-label="Application navigation">
+              {PRIMARY_NAV_ITEMS.map((item) => {
+                const isSelected = activeRoute === item.id && !activeAssessment
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={`nav-tab ${isSelected ? 'nav-tab-active' : ''}`}
+                    onClick={() => handleSelectRoute(item.id)}
+                  >
+                    {item.label}
+                  </button>
+                )
+              })}
+            </nav>
           </div>
-
-          <nav className="primary-nav" aria-label="Application navigation">
-            {PRIMARY_NAV_ITEMS.map((item) => {
-              const isSelected = activeRoute === item.id
-              const classes = [
-                'nav-tab',
-                isSelected ? 'nav-tab-active' : '',
-                item.secondary ? 'nav-tab-secondary' : '',
-              ]
-                .filter(Boolean)
-                .join(' ')
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  className={classes}
-                  onClick={() => handleSelectRoute(item.id)}
-                >
-                  {item.label}
-                </button>
-              )
-            })}
-          </nav>
         </div>
       </header>
 
@@ -268,6 +232,8 @@ function App() {
                 assessments={assessments}
                 loadingRecords={loadingRecords}
                 recordsError={recordsError}
+                genaiHealth={genaiHealth}
+                genaiHealthError={genaiHealthError}
                 onRefreshRecords={handleRefreshRecords}
                 onNavigate={handleSelectRoute}
                 onStartNewAssessment={handleStartNewAssessment}
@@ -277,48 +243,16 @@ function App() {
 
             {activeRoute === 'new-assessment' && (
               <PatientAssessmentWorkflow
+                key={prefillAssessment?.id ?? prefillPatient?.id ?? 'new'}
                 patients={patients}
-                health={health}
-                healthError={healthError}
                 prefillPatient={prefillPatient}
-                onRefreshHealth={handleRefreshHealth}
+                prefillAssessment={prefillAssessment}
                 onAssessmentSaved={handleAssessmentSaved}
                 onCancel={() => handleSelectRoute('dashboard')}
               />
             )}
 
-            {activeRoute === 'patient-records' && (
-              <PatientRecordsView
-                patients={patients}
-                assessments={assessments}
-                loading={loadingRecords}
-                error={recordsError}
-                onRefresh={handleRefreshRecords}
-                onStartNewAssessment={handleStartNewAssessment}
-              />
-            )}
-
-            {activeRoute === 'assessment-history' && (
-              <AssessmentHistoryView
-                assessments={assessments}
-                loading={loadingRecords}
-                error={recordsError}
-                onRefresh={handleRefreshRecords}
-                onViewAssessmentResult={handleViewAssessmentResult}
-                onStartNewAssessment={() => handleStartNewAssessment()}
-              />
-            )}
-
-            {activeRoute === 'research-info' && (
-              <ResearchInformationView
-                health={health}
-                healthError={healthError}
-                checkingHealth={checkingHealth}
-                predictionResult={standalonePredictionResult}
-                onPredictionResultChange={setStandalonePredictionResult}
-                onRefreshHealth={handleRefreshHealth}
-              />
-            )}
+            {activeRoute === 'knowledge-base' && <KnowledgeBaseView />}
           </>
         )}
       </main>

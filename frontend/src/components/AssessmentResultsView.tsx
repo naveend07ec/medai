@@ -4,14 +4,18 @@ import {
   fetchGenAIHealth,
   generateAssessmentReport,
   reviewAssessmentReport,
-  updateAssessmentReview,
 } from '../api/clinical'
+import { ApiRequestError } from '../api/client'
 import type {
   ClinicalAssessmentRecord,
   DiagnosticReportRecord,
+  EmergencyAlert,
   GenAIHealthStatus,
 } from '../types/assessment'
 import { computeAgeYears } from '../utils/assessmentValidation'
+import { sanitizeClinicalAiText } from '../utils/aiTextSanitizer'
+import { DiagnosticReportDisplay } from './DiagnosticReportDisplay'
+import { EmergencyAlertBanner } from './EmergencyAlertBanner'
 
 interface AssessmentResultsViewProps {
   assessment: ClinicalAssessmentRecord
@@ -21,8 +25,18 @@ interface AssessmentResultsViewProps {
   onBackToDashboard: () => void
 }
 
-function formatPercent(probability: number): string {
-  return `${(probability * 100).toFixed(2)}%`
+function formatDateTime(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+  } catch {
+    return iso
+  }
 }
 
 export function AssessmentResultsView({
@@ -32,94 +46,78 @@ export function AssessmentResultsView({
   onStartAnother,
   onBackToDashboard,
 }: AssessmentResultsViewProps) {
-  const [updatingReview, setUpdatingReview] = useState(false)
   const [reviewError, setReviewError] = useState<string | null>(null)
 
   const [genaiHealth, setGenaiHealth] = useState<GenAIHealthStatus | null>(null)
+  const [healthError, setHealthError] = useState<string | null>(null)
   const [report, setReport] = useState<DiagnosticReportRecord | null>(null)
-  const [loadingReport, setLoadingReport] = useState(true)
+  const [loadedAssessmentId, setLoadedAssessmentId] = useState<string | null>(null)
   const [generatingReport, setGeneratingReport] = useState(false)
   const [reportError, setReportError] = useState<string | null>(null)
+  const [fallbackEmergencyAlert, setFallbackEmergencyAlert] =
+    useState<EmergencyAlert | null>(null)
   const [clinicianNotesDraft, setClinicianNotesDraft] = useState('')
   const [savingReportReview, setSavingReportReview] = useState(false)
 
+  const loadingReport = loadedAssessmentId !== assessment.id
   const patient = assessment.patient
   const ageYears = patient ? computeAgeYears(patient.date_of_birth) : null
-  const preprocessing = assessment.preprocessing_summary
-  const predictiveOutcome = assessment.predictive_experiment_result
 
   useEffect(() => {
     let active = true
 
-    Promise.all([
-      fetchGenAIHealth().catch(() => null),
+    Promise.allSettled([
+      fetchGenAIHealth(),
       fetchAssessmentReport(assessment.id),
-    ])
-      .then(([healthStatus, existingReport]) => {
-        if (!active) return
-        setGenaiHealth(healthStatus)
-        setReport(existingReport)
-        setClinicianNotesDraft(existingReport?.clinician_notes ?? '')
-        setReportError(null)
-      })
-      .catch((err: unknown) => {
-        if (!active) return
-        setReportError(
-          err instanceof Error
-            ? err.message
-            : 'Unable to check existing diagnostic report.',
-        )
-      })
-      .finally(() => {
-        if (active) {
-          setLoadingReport(false)
-        }
-      })
+    ]).then(([healthRes, reportRes]) => {
+      if (!active) return
+
+      if (healthRes.status === 'fulfilled') {
+        setGenaiHealth(healthRes.value)
+        setHealthError(null)
+      } else {
+        const msg =
+          healthRes.reason instanceof Error
+            ? healthRes.reason.message
+            : 'Unable to check Clinical AI health status.'
+        setGenaiHealth(null)
+        setHealthError(msg)
+      }
+
+      if (reportRes.status === 'fulfilled') {
+        setReport(reportRes.value)
+        setClinicianNotesDraft(reportRes.value?.clinician_notes ?? '')
+      } else {
+        setReport(null)
+      }
+      setReportError(null)
+      setFallbackEmergencyAlert(null)
+      setLoadedAssessmentId(assessment.id)
+    })
 
     return () => {
       active = false
     }
   }, [assessment.id])
 
-  async function handleToggleAssessmentReview() {
-    setUpdatingReview(true)
-    setReviewError(null)
-    try {
-      const updated = await updateAssessmentReview(
-        assessment.id,
-        !assessment.clinician_reviewed,
-      )
-      onAssessmentUpdated(updated)
-    } catch (err: unknown) {
-      setReviewError(
-        err instanceof Error
-          ? err.message
-          : 'Unable to update clinician review status.',
-      )
-    } finally {
-      setUpdatingReview(false)
-    }
-  }
-
   async function handleGenerateReport() {
     setGeneratingReport(true)
     setReportError(null)
+    setFallbackEmergencyAlert(null)
+
     try {
       const generated = await generateAssessmentReport(assessment.id)
       setReport(generated)
       setClinicianNotesDraft(generated.clinician_notes ?? '')
-      if (assessment.clinician_reviewed) {
-        onAssessmentUpdated({ ...assessment, clinician_reviewed: false })
+    } catch (err) {
+      if (err instanceof ApiRequestError && err.emergencyAlert) {
+        setFallbackEmergencyAlert(err.emergencyAlert)
       }
-    } catch (err: unknown) {
       setReportError(
         err instanceof Error
           ? err.message
-          : 'Unable to generate AI diagnostic report.',
+          : 'Unable to generate diagnostic output via Clinical AI.',
       )
-      fetchGenAIHealth()
-        .then(setGenaiHealth)
-        .catch(() => null)
     } finally {
       setGeneratingReport(false)
     }
@@ -132,296 +130,283 @@ export function AssessmentResultsView({
       const updatedReport = await reviewAssessmentReport(
         assessment.id,
         nextReviewed,
-        clinicianNotesDraft,
+        clinicianNotesDraft.trim() || undefined,
       )
       setReport(updatedReport)
       onAssessmentUpdated({
         ...assessment,
         clinician_reviewed: updatedReport.clinician_reviewed,
       })
-    } catch (err: unknown) {
+    } catch (err) {
       setReviewError(
-        err instanceof Error
-          ? err.message
-          : 'Unable to save clinician review on the report.',
+        err instanceof Error ? err.message : 'Unable to save clinician review.',
       )
     } finally {
       setSavingReportReview(false)
     }
   }
 
+  const displayName = patient?.full_name || 'Patient Record'
+  const initials = displayName
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() ?? '')
+    .join('')
+
   return (
-    <div className="results-workspace">
-      {justSavedBanner && (
-        <div className="alert alert-success" role="status">
-          <strong>Saved:</strong> {justSavedBanner}
-        </div>
-      )}
-
-      {reviewError && (
-        <div className="alert alert-error" role="alert">
-          <strong>Review update failed:</strong> {reviewError}
-        </div>
-      )}
-
+    <div className="results-view">
+      {/* Top Action & Breadcrumb Header */}
       <div className="results-topbar">
-        <div>
-          <span className="hero-eyebrow">
-            Persisted Assessment Report • Clinician Review Required
-          </span>
-          <h2>Diagnostic Insights &amp; Treatment Support</h2>
-          <p className="results-subtitle">
-            Patient: <strong>{patient?.full_name ?? 'Unknown Patient'}</strong> (Code:{' '}
-            <code>{patient?.patient_code ?? assessment.patient_id}</code>) •
-            Recorded {new Date(assessment.created_at).toLocaleString()}
-          </p>
-        </div>
-
-        <div className="results-top-actions">
+        <div className="results-topbar-left">
           <button
             type="button"
-            className="btn-primary"
-            onClick={handleGenerateReport}
-            disabled={generatingReport}
-          >
-            {generatingReport
-              ? 'Generating AI Report…'
-              : report
-                ? 'Regenerate AI Assessment Report'
-                : 'Generate AI Assessment Report'}
-          </button>
-          <button
-            type="button"
-            className={
-              assessment.clinician_reviewed ? 'btn-reviewed' : 'btn-secondary'
-            }
-            onClick={handleToggleAssessmentReview}
-            disabled={updatingReview}
-          >
-            {updatingReview
-              ? 'Updating…'
-              : assessment.clinician_reviewed
-                ? '✓ Assessment Reviewed'
-                : 'Mark Assessment Reviewed'}
-          </button>
-          <button
-            type="button"
-            className="btn-secondary"
-            onClick={onStartAnother}
-          >
-            New Assessment
-          </button>
-          <button
-            type="button"
-            className="btn-secondary"
+            className="btn-secondary btn-sm"
             onClick={onBackToDashboard}
           >
-            Dashboard
+            ← Patient Records
+          </button>
+          <span className="topbar-divider" aria-hidden="true" />
+          <span className="topbar-crumb">
+            Assessment ID: <code>{assessment.id.slice(0, 8)}</code> · Recorded{' '}
+            {formatDateTime(assessment.created_at)}
+          </span>
+        </div>
+
+        <div className="results-topbar-right">
+          <span
+            className={`status-pill ${
+              assessment.clinician_reviewed ? 'pill-ready' : 'pill-warn'
+            }`}
+          >
+            {assessment.clinician_reviewed ? 'Reviewed' : 'Pending Review'}
+          </span>
+          <button
+            type="button"
+            className="btn-primary btn-sm"
+            onClick={onStartAnother}
+          >
+            + New Analysis
           </button>
         </div>
       </div>
 
-      {/* GenAI Diagnostic Report Section (Primary Outcome) */}
-      <section className="panel genai-report-panel" aria-labelledby="genai-report-heading">
-        <div className="card-header-row">
+      {justSavedBanner && (
+        <div className="alert alert-info" role="status">
+          {justSavedBanner}
+        </div>
+      )}
+
+      {fallbackEmergencyAlert?.emergency_detected && (
+        <EmergencyAlertBanner
+          alert={fallbackEmergencyAlert}
+          generatedByGemini={false}
+          notice="Emergency red-flag screening operated independently without calling the Clinical AI engine. Because AI report generation could not complete, no AI report was persisted."
+        />
+      )}
+
+      {/* Digcy-Inspired Clinical Profile & Vitals Snapshot */}
+      <section className="clinical-snapshot-grid" aria-label="Patient clinical overview">
+        <div className="panel clinical-patient-card">
+          <div className="clinical-profile-head">
+            <div className="patient-monogram patient-monogram-lg" aria-hidden="true">
+              {initials || 'PT'}
+            </div>
+            <div>
+              <span className="section-kicker">Patient Clinical Summary</span>
+              <h2>{displayName}</h2>
+              <p className="clinical-profile-meta">
+                {patient ? (
+                  <>
+                    Code <code>{patient.patient_code}</code> ·{' '}
+                    {ageYears !== null ? `${ageYears} yrs · ` : ''}
+                    {patient.sex || 'Sex N/A'} · DOB {patient.date_of_birth}
+                  </>
+                ) : (
+                  `Patient ID: ${assessment.patient_id}`
+                )}
+              </p>
+            </div>
+          </div>
+
+          {/* Recorded Vitals Strip (real data only, never invented) */}
+          <div className="vitals-grid-strip" aria-label="Recorded vital measurements">
+            <div className="vital-metric-card">
+              <span className="vital-metric-label">Blood Pressure</span>
+              <strong className="vital-metric-value">
+                {assessment.systolic_bp != null || assessment.diastolic_bp != null
+                  ? `${assessment.systolic_bp ?? '—'}/${assessment.diastolic_bp ?? '—'}`
+                  : 'Not recorded'}
+              </strong>
+              <span className="vital-metric-unit">mm Hg</span>
+            </div>
+
+            <div className="vital-metric-card">
+              <span className="vital-metric-label">Heart Rate</span>
+              <strong className="vital-metric-value">
+                {assessment.heart_rate != null ? assessment.heart_rate : 'Not recorded'}
+              </strong>
+              <span className="vital-metric-unit">bpm</span>
+            </div>
+
+            <div className="vital-metric-card">
+              <span className="vital-metric-label">Temperature</span>
+              <strong className="vital-metric-value">
+                {assessment.body_temperature != null
+                  ? assessment.body_temperature
+                  : 'Not recorded'}
+              </strong>
+              <span className="vital-metric-unit">°C</span>
+            </div>
+
+            <div className="vital-metric-card">
+              <span className="vital-metric-label">SpO₂</span>
+              <strong className="vital-metric-value">
+                {assessment.oxygen_saturation != null
+                  ? `${assessment.oxygen_saturation}%`
+                  : 'Not recorded'}
+              </strong>
+              <span className="vital-metric-unit">Oxygen saturation</span>
+            </div>
+          </div>
+
+          <div className="recorded-context-grid">
+            <div className="recorded-context-item">
+              <span>Presenting Symptoms</span>
+              <p>{assessment.current_symptoms || 'None entered'}</p>
+              {assessment.symptom_duration && (
+                <small>Duration: {assessment.symptom_duration}</small>
+              )}
+            </div>
+            <div className="recorded-context-item">
+              <span>History &amp; Medications</span>
+              <p>{assessment.previous_conditions || 'No prior history entered'}</p>
+              {assessment.existing_medications && (
+                <small>Medications: {assessment.existing_medications}</small>
+              )}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Centerpiece: Clinical AI + RAG Diagnostic Output */}
+      <section
+        className="panel diagnostic-centerpiece-panel"
+        aria-labelledby="diagnostic-output-heading"
+      >
+        <div className="diagnostic-header-bar">
           <div>
-            <h3 id="genai-report-heading">
-              GenAI Clinical Assessment Report (Structured 8-Section Output)
-            </h3>
-            <p className="record-subtext">
-              {genaiHealth
-                ? `Provider: ${genaiHealth.provider} (${genaiHealth.model_name}) • Medical RAG: ${
-                    genaiHealth.rag_connected ? 'Connected' : 'Not Connected'
-                  }`
-                : 'Checking GenAI service configuration…'}
+            <span className="section-kicker">Diagnostic Support</span>
+            <h2 id="diagnostic-output-heading">Diagnostic Output</h2>
+            <p className="diagnostic-header-sub">
+              Clear explanations grounded in verified medical references and reviewed by a
+              clinician.
             </p>
           </div>
-          <div className="status-controls">
-            {genaiHealth?.status === 'ready' ? (
-              <span className="status-pill status-ready">GenAI Ready</span>
-            ) : (
-              <span className="status-pill status-warn">GenAI Unavailable</span>
-            )}
+
+          <div className="diagnostic-controls">
+            {genaiHealth ? (
+              <span
+                className={`status-pill ${
+                  genaiHealth.status === 'ready' ? 'pill-ready' : 'pill-warn'
+                }`}
+              >
+                {genaiHealth.status === 'ready'
+                  ? 'Clinical AI Ready'
+                  : 'Clinical AI Unavailable'}
+              </span>
+            ) : healthError ? (
+              <span className="status-pill pill-warn">Status Unknown</span>
+            ) : null}
+
             <button
               type="button"
-              className="btn-primary btn-sm"
-              onClick={handleGenerateReport}
+              className="btn-primary"
               disabled={generatingReport}
+              onClick={handleGenerateReport}
             >
               {generatingReport
-                ? 'Analyzing…'
+                ? 'Generating Diagnostic Output…'
                 : report
-                  ? 'Regenerate Report'
-                  : 'Generate AI Assessment Report'}
+                  ? 'Regenerate Diagnostic Output'
+                  : 'Generate Diagnostic Output'}
             </button>
           </div>
         </div>
 
+        {genaiHealth?.detail && (
+          <div
+            className={`alert ${genaiHealth.status === 'ready' ? 'alert-info' : 'alert-warn'}`}
+            role="status"
+          >
+            {sanitizeClinicalAiText(genaiHealth.detail)}
+          </div>
+        )}
+
+        {healthError && !genaiHealth && (
+          <div className="alert alert-warn" role="status">
+            {sanitizeClinicalAiText(healthError)}
+          </div>
+        )}
+
         {reportError && (
           <div className="alert alert-error" role="alert">
-            <strong>GenAI Report Service Unavailable:</strong> {reportError}
+            <strong>Diagnostic Generation Error:</strong>{' '}
+            {sanitizeClinicalAiText(reportError)}
           </div>
         )}
 
         {generatingReport && (
-          <div className="info-banner" role="status">
-            Analyzing de-identified clinical assessment findings with the configured
-            GenAI provider and persisting the structured report…
+          <div className="generating-status-box" role="status">
+            <div className="upload-progress-bar">
+              <div className="upload-progress-indeterminate" />
+            </div>
+            <p>
+              Running safety screening, retrieving verified medical references, and
+              preparing diagnostic output…
+            </p>
           </div>
         )}
 
         {loadingReport ? (
-          <div className="empty-card-state">
-            <p>Checking for persisted diagnostic report…</p>
-          </div>
+          <p className="empty-state">Checking for an existing diagnostic report…</p>
         ) : !report ? (
-          <div className="unavailable-box" role="status">
-            <strong>No GenAI Diagnostic Report Generated Yet</strong>
+          <div className="empty-state-box">
             <p>
               {genaiHealth?.status === 'ready'
-                ? 'Click "Generate AI Assessment Report" above to analyze this saved assessment and persist a structured 8-section clinician-reviewable report.'
-                : genaiHealth?.detail ??
-                  'Configure GENAI_API_KEY in backend/.env to enable AI diagnostic report generation. No fake or fallback AI narrative is generated when credentials are unavailable.'}
+                ? 'Click "Generate Diagnostic Output" above to analyze this patient assessment and create a diagnostic report.'
+                : 'Configure the AI service credentials in backend/.env to enable diagnostic report generation.'}
             </p>
           </div>
         ) : (
-          <div className="report-sections-stack">
-            <div className="report-meta-strip">
-              <span>
-                Generated by <strong>{report.provider}</strong> ({report.model_name})
-              </span>
-              <span>
-                Created: {new Date(report.created_at).toLocaleString()}
-              </span>
-              <span
-                className={
-                  report.clinician_reviewed
-                    ? 'status-pill status-ready'
-                    : 'status-pill status-warn'
-                }
-              >
-                {report.clinician_reviewed
-                  ? `Reviewed${report.reviewed_at ? ` (${new Date(report.reviewed_at).toLocaleString()})` : ''}`
-                  : 'Pending Clinician Review'}
-              </span>
-            </div>
+          <div className="report-body-wrapper">
+            <DiagnosticReportDisplay report={report.report} />
 
-            <div className="report-grid-two">
-              <div className="report-section-card">
-                <h4>1. Patient Clinical Summary</h4>
-                <p>{report.report.patient_clinical_summary}</p>
-              </div>
-
-              <div className="report-section-card">
-                <h4>2. Available Clinical Findings (Observed Data)</h4>
-                <ul className="clean-list">
-                  {report.report.available_clinical_findings.map((finding) => (
-                    <li key={finding}>{finding}</li>
-                  ))}
-                </ul>
-              </div>
-            </div>
-
-            <div className="report-section-card report-ai-card">
-              <div className="card-header-row">
-                <h4>3. AI-Generated Diagnostic Insights</h4>
-                <span className="pill-separate">AI Interpretation (Non-Diagnostic)</span>
-              </div>
-              <p>{report.report.ai_generated_diagnostic_insights}</p>
-            </div>
-
-            <div className="report-section-card">
-              <h4>4. Possible Diagnostic Considerations &amp; Supporting Evidence</h4>
-              {report.report.possible_diagnostic_considerations.length === 0 ? (
-                <p className="muted-text">
-                  No specific diagnostic considerations returned for the available data.
-                </p>
-              ) : (
-                <div className="considerations-grid">
-                  {report.report.possible_diagnostic_considerations.map((item) => (
-                    <div key={item.condition_or_pattern} className="consideration-item">
-                      <strong>{item.condition_or_pattern}</strong>
-                      <p>{item.rationale}</p>
-                      {item.supporting_observed_evidence.length > 0 && (
-                        <div className="consideration-meta">
-                          <span>Observed Evidence:</span>{' '}
-                          {item.supporting_observed_evidence.join('; ')}
-                        </div>
-                      )}
-                      <div className="consideration-uncertainty">
-                        <span>Uncertainty:</span> {item.uncertainty_note}
-                      </div>
-                    </div>
-                  ))}
+            {/* 08. Clinician Review & Sign-Off */}
+            <section
+              className="report-editorial-block report-review-block"
+              aria-labelledby="rep-clinician-review-heading"
+            >
+              <div className="report-block-header">
+                <span className="report-section-num">08</span>
+                <div className="report-block-title-row">
+                  <div>
+                    <h4 id="rep-clinician-review-heading">
+                      Clinician Review &amp; Approval
+                    </h4>
+                    <p className="report-block-subtitle">
+                      Verify diagnostic considerations and sign off before clinical use.
+                    </p>
+                  </div>
+                  <span
+                    className={`status-pill ${
+                      report.clinician_reviewed ? 'pill-ready' : 'pill-warn'
+                    }`}
+                  >
+                    {report.clinician_reviewed ? 'Report Reviewed' : 'Awaiting Sign-Off'}
+                  </span>
                 </div>
-              )}
-            </div>
-
-            <div className="report-grid-two">
-              <div className="report-section-card">
-                <h4>5. Missing Information &amp; Uncertainty</h4>
-                <ul className="clean-list">
-                  {report.report.missing_information_and_uncertainty.map((item) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ul>
               </div>
-
-              <div className="report-section-card">
-                <h4>6. Further Clinical Evaluation Considerations</h4>
-                <ul className="clean-list">
-                  {report.report.further_clinical_evaluation_considerations.map(
-                    (item) => (
-                      <li key={item}>{item}</li>
-                    ),
-                  )}
-                </ul>
-              </div>
-            </div>
-
-            <div className="report-section-card">
-              <div className="card-header-row">
-                <h4>7. Personalized Treatment-Support Information</h4>
-                <span
-                  className={
-                    report.report.personalized_treatment_support
-                      .grounded_in_verified_references
-                      ? 'status-pill status-ready'
-                      : 'pill-unavailable'
-                  }
-                >
-                  {report.report.personalized_treatment_support
-                    .grounded_in_verified_references
-                    ? 'Grounded in Verified References'
-                    : 'Withheld — RAG Not Connected'}
-                </span>
-              </div>
-              <p>{report.report.personalized_treatment_support.status_note}</p>
-              {report.report.personalized_treatment_support.retrieved_references
-                .length > 0 && (
-                <ul className="clean-list">
-                  {report.report.personalized_treatment_support.retrieved_references.map(
-                    (ref) => (
-                      <li key={ref.title}>
-                        <strong>{ref.title}</strong> ({ref.source} —{' '}
-                        {ref.guideline_or_citation}): {ref.relevance_note}
-                      </li>
-                    ),
-                  )}
-                </ul>
-              )}
-            </div>
-
-            <div className="report-section-card report-review-card">
-              <h4>8. Clinician Review &amp; Safety Disclaimer</h4>
-              <p className="disclaimer-copy">
-                {report.report.clinician_review_and_safety_disclaimer}
-              </p>
-              <p className="research-note-copy">
-                <strong>Predictive &amp; Research Separation:</strong>{' '}
-                {report.report.predictive_model_separation_note.summary}{' '}
-                {report.report.research_context_note}
-              </p>
 
               <div className="clinician-review-form">
                 <label htmlFor="clinician-report-notes" className="field-label">
@@ -429,268 +414,52 @@ export function AssessmentResultsView({
                 </label>
                 <textarea
                   id="clinician-report-notes"
-                  rows={2}
-                  placeholder="Enter clinical verification notes, follow-up plan, or corrections..."
+                  rows={3}
+                  placeholder="Document clinical impression, verification against physical exam, or modifications to suggested considerations..."
                   value={clinicianNotesDraft}
                   onChange={(e) => setClinicianNotesDraft(e.target.value)}
                 />
-                <div className="form-actions">
+
+                {reviewError && (
+                  <div className="alert alert-error" role="alert">
+                    {reviewError}
+                  </div>
+                )}
+
+                <div className="clinician-review-actions">
                   <button
                     type="button"
-                    className="btn-primary btn-sm"
-                    onClick={() => handleSaveReportReview(true)}
+                    className="btn-primary"
                     disabled={savingReportReview}
+                    onClick={() => handleSaveReportReview(true)}
                   >
                     {savingReportReview
                       ? 'Saving Review…'
                       : 'Approve & Mark Report Reviewed'}
                   </button>
+
                   {report.clinician_reviewed && (
                     <button
                       type="button"
                       className="btn-secondary btn-sm"
-                      onClick={() => handleSaveReportReview(false)}
                       disabled={savingReportReview}
+                      onClick={() => handleSaveReportReview(false)}
                     >
-                      Reopen as Pending Review
+                      Mark Pending Review
                     </button>
+                  )}
+
+                  {report.reviewed_at && (
+                    <span className="review-timestamp">
+                      Signed off {formatDateTime(report.reviewed_at)}
+                    </span>
                   )}
                 </div>
               </div>
-            </div>
+            </section>
           </div>
         )}
       </section>
-
-      <div className="results-two-column">
-        <section className="panel" aria-labelledby="patient-summary-heading">
-          <h3 id="patient-summary-heading">Recorded Assessment Summary</h3>
-          <dl className="summary-kv-list">
-            <div>
-              <dt>Patient Code</dt>
-              <dd>{patient?.patient_code ?? '—'}</dd>
-            </div>
-            <div>
-              <dt>Name</dt>
-              <dd>{patient?.full_name ?? '—'}</dd>
-            </div>
-            <div>
-              <dt>DOB / Age / Sex</dt>
-              <dd>
-                {patient?.date_of_birth ?? '—'}
-                {ageYears !== null ? ` (${ageYears} yrs)` : ''} •{' '}
-                {patient?.sex ?? 'Not specified'}
-              </dd>
-            </div>
-            <div>
-              <dt>Data Modalities Provided</dt>
-              <dd>
-                {preprocessing?.providedModalities?.join(', ') ||
-                  'Recorded clinical assessment'}
-              </dd>
-            </div>
-          </dl>
-
-          <div className="subsection-block">
-            <h4>Preprocessing &amp; Privacy Pipeline</h4>
-            <ul className="clean-list">
-              {preprocessing ? (
-                <>
-                  <li>
-                    Validated {preprocessing.validatedMeasurementsCount} structured
-                    vital-sign field(s); missing modalities (
-                    {preprocessing.missingModalities.join(', ') || 'none'}) were not
-                    fabricated.
-                  </li>
-                  {preprocessing.unusualMeasurementWarnings &&
-                    preprocessing.unusualMeasurementWarnings.length > 0 && (
-                      <li>
-                        <strong>Unusual measurement warnings:</strong>{' '}
-                        {preprocessing.unusualMeasurementWarnings.join(' | ')}
-                      </li>
-                    )}
-                  {preprocessing.imputationAppliedNote && (
-                    <li>{preprocessing.imputationAppliedNote}</li>
-                  )}
-                </>
-              ) : (
-                <li>Structured assessment persisted in PostgreSQL.</li>
-              )}
-              <li>
-                Patient demographic identity (<code>patients</code>) is stored
-                separately from clinical observations (<code>clinical_assessments</code>).
-              </li>
-            </ul>
-          </div>
-        </section>
-
-        <section className="panel" aria-labelledby="predictive-results-heading">
-          <div className="card-header-row">
-            <h3 id="predictive-results-heading">
-              Separate Disease-Specific Predictive Experiment
-            </h3>
-            <span className="pill-separate">Pima XGBoost Statistical Model</span>
-          </div>
-
-          {predictiveOutcome?.status === 'completed' && predictiveOutcome.result ? (
-            <div className="result-content">
-              <div className="predicted-class-card">
-                <span className="result-label">
-                  {predictiveOutcome.result.module_name} (
-                  {predictiveOutcome.result.model_name})
-                </span>
-                <strong className="result-class-value">
-                  Predicted Class {predictiveOutcome.result.predicted_class}
-                </strong>
-                <span className="result-class-note">
-                  Model version: {predictiveOutcome.result.model_version}
-                </span>
-              </div>
-
-              <div className="prob-list">
-                <div className="prob-item">
-                  <div className="prob-header">
-                    <span>Class 0 Model-Estimated Probability</span>
-                    <strong>
-                      {formatPercent(predictiveOutcome.result.class_0_probability)}
-                    </strong>
-                  </div>
-                  <div className="prob-bar-track" aria-hidden="true">
-                    <div
-                      className="prob-bar-fill prob-bar-zero"
-                      style={{
-                        width: `${Math.min(100, Math.max(0, predictiveOutcome.result.class_0_probability * 100))}%`,
-                      }}
-                    />
-                  </div>
-                </div>
-
-                <div className="prob-item">
-                  <div className="prob-header">
-                    <span>Class 1 Model-Estimated Probability</span>
-                    <strong>
-                      {formatPercent(predictiveOutcome.result.class_1_probability)}
-                    </strong>
-                  </div>
-                  <div className="prob-bar-track" aria-hidden="true">
-                    <div
-                      className="prob-bar-fill prob-bar-one"
-                      style={{
-                        width: `${Math.min(100, Math.max(0, predictiveOutcome.result.class_1_probability * 100))}%`,
-                      }}
-                    />
-                  </div>
-                </div>
-              </div>
-
-              <div className="api-disclaimer">
-                <strong>Model Disclaimer:</strong>{' '}
-                {predictiveOutcome.result.clinical_disclaimer}
-              </div>
-            </div>
-          ) : (
-            <div className="unavailable-box" role="status">
-              <strong>
-                {predictiveOutcome?.status === 'not-requested' || !predictiveOutcome
-                  ? 'Disease-Specific Predictive Experiment Not Run'
-                  : 'Predictive Model Analysis Unavailable'}
-              </strong>
-              <p>
-                {predictiveOutcome?.message ??
-                  'No predictive experiment was executed for this assessment.'}
-              </p>
-            </div>
-          )}
-        </section>
-
-        <section className="panel" aria-labelledby="supporting-clinical-heading">
-          <h3 id="supporting-clinical-heading">Supporting Clinical Inputs</h3>
-          <div className="supporting-sections">
-            <div>
-              <h4>Symptoms &amp; Medical History</h4>
-              <p>
-                {[
-                  assessment.current_symptoms &&
-                    `Symptoms: ${assessment.current_symptoms}`,
-                  assessment.symptom_duration &&
-                    `Duration: ${assessment.symptom_duration}`,
-                  assessment.previous_conditions &&
-                    `Conditions: ${assessment.previous_conditions}`,
-                  assessment.existing_medications &&
-                    `Medications: ${assessment.existing_medications}`,
-                  assessment.medical_history_notes,
-                ]
-                  .filter(Boolean)
-                  .join(' • ') || 'No symptoms or history notes entered.'}
-              </p>
-            </div>
-
-            <div>
-              <h4>Clinical Measurements</h4>
-              <p>
-                {[
-                  (assessment.systolic_bp !== null ||
-                    assessment.diastolic_bp !== null) &&
-                    `BP: ${assessment.systolic_bp ?? '—'}/${assessment.diastolic_bp ?? '—'} mm Hg`,
-                  assessment.heart_rate !== null &&
-                    `HR: ${assessment.heart_rate} bpm`,
-                  assessment.body_temperature !== null &&
-                    `Temp: ${assessment.body_temperature} °C`,
-                  assessment.oxygen_saturation !== null &&
-                    `SpO₂: ${assessment.oxygen_saturation}%`,
-                  assessment.additional_measurements,
-                ]
-                  .filter(Boolean)
-                  .join(' • ') || 'No general vital signs entered.'}
-              </p>
-            </div>
-
-            <div>
-              <h4>Medical Records, Images &amp; Genomic Context</h4>
-              <p>
-                {[
-                  assessment.lab_results && `Labs: ${assessment.lab_results}`,
-                  assessment.ehr_summary && `EHR: ${assessment.ehr_summary}`,
-                  assessment.attached_report_names.length > 0 &&
-                    `Attached report metadata (not extracted/analyzed): ${assessment.attached_report_names.join(', ')}`,
-                  assessment.attached_images.length > 0 &&
-                    `Attached images (unprocessed): ${assessment.attached_images.map((img) => img.name).join(', ')}`,
-                  assessment.imaging_notes &&
-                    `Imaging notes: ${assessment.imaging_notes}`,
-                  assessment.family_history_markers &&
-                    `Genetic context: ${assessment.family_history_markers}`,
-                  assessment.genomic_notes &&
-                    `Genomic notes (unprocessed): ${assessment.genomic_notes}`,
-                ]
-                  .filter(Boolean)
-                  .join(' • ') || 'No records, images, or genomic notes attached.'}
-              </p>
-            </div>
-          </div>
-        </section>
-
-        <section className="panel" aria-labelledby="governance-heading">
-          <h3 id="governance-heading">Clinical Governance &amp; Platform Scope</h3>
-          <div className="clinician-governance-box">
-            <strong>Safety &amp; Scope Guardrails:</strong>
-            <ul>
-              <li>
-                Observed clinical inputs are kept separate from AI-generated
-                interpretations and disease-specific tabular probabilities.
-              </li>
-              <li>
-                Automated medical image analysis, genomic interpretation, and Medical
-                RAG guideline retrieval are not yet connected.
-              </li>
-              <li>
-                Qualified clinicians remain solely responsible for reviewing and
-                approving clinical decisions; autonomous prescribing is never
-                performed.
-              </li>
-            </ul>
-          </div>
-        </section>
-      </div>
     </div>
   )
 }

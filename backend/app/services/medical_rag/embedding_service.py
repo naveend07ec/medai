@@ -161,3 +161,4 @@ class GeminiEmbeddingService:
 
 
 embedding_service = GeminiEmbeddingService()
+

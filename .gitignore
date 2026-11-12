@@ -5,6 +5,7 @@ frontend/.env
 
 # Python / Backend
 backend/.venv/
+backend/uploads/
 __pycache__/
 *.py[cod]
 .pytest_cache/
