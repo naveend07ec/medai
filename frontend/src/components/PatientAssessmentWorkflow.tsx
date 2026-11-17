@@ -359,6 +359,7 @@ export function PatientAssessmentWorkflow({
         ehr_summary: draft.medicalRecords.ehrSummary.trim() || undefined,
         previous_reports: draft.medicalRecords.previousReports.trim() || undefined,
         attached_report_names: draft.medicalRecords.attachedReportNames,
+        attached_images: draft.medicalImages.attachedImages,
         imaging_notes: draft.medicalImages.imagingNotes.trim() || undefined,
         clinician_reviewed: false,
       })
