@@ -85,7 +85,7 @@ export async function generateAssessmentReport(
     `/api/v1/assessments/${encodeURIComponent(assessmentId)}/generate-report`,
     { method: 'POST' },
     'Unable to reach the GenAI diagnostic report endpoint. Confirm FastAPI is running.',
-    60000,
+    300000,
   )
 }
 
